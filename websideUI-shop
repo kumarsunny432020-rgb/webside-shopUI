@@ -1,1 +1,2090 @@
+#include <Arduino.h>
+#include <U8g2lib.h>
+#include <Wire.h>
+#include <math.h>
+#include <WiFi.h>
+#include "time.h"
+#include <WiFiClientSecure.h>
+#include <UniversalTelegramBot.h>
+#include <ArduinoOTA.h>
+#include <EEPROM.h>
 
+// ==================== DISPLAY ====================
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
+
+// ==================== PINS ====================
+#define TRIG_PIN 5
+#define ECHO_PIN 18
+
+#define BTN1 6
+#define BTN2 7
+#define BTN3 12
+#define BTN4 13
+#define BTN5 14
+
+#define RELAY_PIN 16
+#define OLED_SDA 8
+#define OLED_SCL 9
+#define LDR_PIN 4
+#define BUZZER_PIN 15
+
+#define TANK_LOW_PIN 10
+#define TANK_HIGH_PIN 11
+
+// ==================== EEPROM ====================
+#define EEPROM_SIZE 512
+#define EE_BOOT_COUNT 16
+
+// ==================== MODES ====================
+#define AUTO_TANK_MODE 100
+
+// ==================== WIFI ====================
+const char* WIFI_SSID = "Shri_RadhaKrishna_Zone";
+const char* WIFI_PASS = "RadheKrishna#108";
+
+// ==================== TELEGRAM ====================
+#define BOT_TOKEN "8287235257:AAFMi2qWwjxkPZNW4eCJYICCgaKPpsP8NRw"
+#define CHAT_ID "1013519432"
+
+WiFiClientSecure client;
+UniversalTelegramBot bot(BOT_TOKEN, client);
+
+QueueHandle_t telegramQueue = NULL;
+
+// ==================== TANK CONFIG ====================
+float tankHeight = 95.0;
+float sensorOffset = 15.0;
+
+// ==================== AI FILTER ====================
+float rawBuffer[5] = {0,0,0,0,0};
+int rawReadingsCount = 0;
+int rawIndex = 0;
+float kalmanEstimate = 0;
+float kalmanError = 1;
+float kalmanQ = 0.02;
+float kalmanR = 2;
+float aiLevel = 0;
+bool kalmanInitialized = false;
+
+// ==================== SYSTEM DATA ====================
+struct SystemData {
+  bool motor;
+  bool forceFlag;
+  bool stopFlag;
+  int timerType;
+  unsigned long timerEndTime;
+  unsigned long motorStartTime;
+  int customTimerSeconds;
+} sys;
+
+bool wifiConnected = false;
+bool ntpSynced = false;
+
+char notificationMsg[30] = "";
+char activeStatus[30] = "MANUAL MODE";
+
+// ==================== TIMING VARIABLES ====================
+unsigned long lastSensorTime = 0;
+unsigned long lastUITime = 0;
+unsigned long lastWiFiCheckTime = 0;
+unsigned long lastTimeFetchTime = 0;
+unsigned long lastClockSwitchTime = 0;
+unsigned long lastStopMessageTime = 0;
+
+// ==================== BOOT DELAY ====================
+unsigned long bootTime = 0;
+bool bootDelayActive = true;
+
+// ==================== AUTO START STATE MACHINE ====================
+bool autoStartPending = false;
+bool telegramPending = false;
+unsigned long autoStartTime = 0;
+unsigned long telegramTime = 0;
+
+// ==================== TELEGRAM ====================
+volatile bool telegramBusy = false;
+bool waitingForCustomTimer = false;
+unsigned long waitingStartTime = 0;
+String customTimerChatId = "";
+unsigned long lastTelegramCheckTime = 0;
+
+// ==================== LDR VARIABLES ====================
+unsigned long lastLightCutTime = 0;
+bool lightCutMessageShowing = false;
+unsigned long noLightMsgStartTime = 0;
+bool noLightMessageShowing = false;
+unsigned long lightReturnTime = 0;
+bool waitingForLightReturn = false;
+unsigned long lastLightAvailableTime = 0;
+unsigned long lightNotAvailableStart = 0;
+
+// ==================== LIGHT STOPWATCH ====================
+unsigned long lightLostTime = 0;
+bool lightStopwatchRunning = false;
+
+// ==================== TANK SENSOR VARIABLES ====================
+unsigned long lastTankFullTime = 0;
+bool tankFullMessageShowing = false;
+
+// ==================== LOW WATER WARNING ====================
+bool lowWaterWarningActive = false;
+bool displayLowWater = false;
+
+// ==================== TELEGRAM REPEAT WARNING ====================
+unsigned long lastTelegramLowWaterTime = 0;
+bool telegramLowWaterSent = false;
+const unsigned long TELEGRAM_REPEAT_INTERVAL = 900000;
+unsigned long alertStartTime = 0;
+
+// ==================== LIGHT OFFLINE TELEGRAM (GLOBAL) ====================
+bool firstLightOffMsgSent = false;
+unsigned long lastLightOffMsgTime = 0;
+
+// ==================== AUTO START MESSAGE ====================
+bool autoStartMessageSent = false;
+bool autoTankStartBlocked = false;
+unsigned long autoModeBlockedTime = 0;
+
+// ==================== BUTTONS ====================
+unsigned long btnPressTime = 0;
+bool btnDelayActive = false;
+int pendingTimerType = 0;
+unsigned long pendingTimerEndTime = 0;
+bool pendingForceFlag = false;
+
+unsigned long btn1PressStartTime = 0;
+bool btn1PressActive = false;
+bool btn1LongPressTriggered = false;
+const unsigned long BTN1_LONG_PRESS_MS = 2000;
+
+bool showingStopMessage = false;
+
+// ==================== TIME VARIABLES ====================
+int sec = 0;
+int minute = 0;
+int hour = 12;
+int day = 29;
+int month = 1;
+int year = 2025;
+int weekday = 2;
+
+const char* days[] = {
+    "Sunday","Monday","Tuesday","Wednesday",
+    "Thursday","Friday","Saturday"
+};
+
+// ==================== SPECIAL EVENTS ====================
+bool specialEventActive = false;
+int specialEventStep = 0;
+unsigned long specialEventLastSwitch = 0;
+const int SPECIAL_STEP_DURATION = 1500;
+
+struct EventSteps {
+  int stepCount;
+  const char* steps[4];
+};
+
+EventSteps getEventSteps(int m, int d) {
+  // ==================== 2026 (January - June) ====================
+  if (year == 2026 && m == 1 && d == 14) return {1, {"MAKAR SANKRANTI"}};
+  if (year == 2026 && m == 1 && d == 23) return {1, {"VASANT PANCHAMI"}};
+  if (year == 2026 && m == 2 && d == 15) return {1, {"MAHASHIVRATRI"}};
+  if (year == 2026 && m == 3 && d == 3) return {1, {"HOLIKA DAHAN"}};
+  if (year == 2026 && m == 3 && d == 4) return {1, {"HAPPY HOLI"}};
+  if (year == 2026 && m == 3 && d == 19) return {1, {"CHAITRA NAVRATRI"}};
+  if (year == 2026 && m == 3 && d == 26) return {1, {"RAM NAVAMI"}};
+  if (year == 2026 && m == 4 && d == 2) return {1, {"HANUMAN JAYANTI"}};
+  if (year == 2026 && m == 4 && d == 19) return {1, {"AKSHAYA TRITIYA"}};
+  if (year == 2026 && m == 5 && d == 1) return {1, {"BUDDHA PURNIMA"}};
+  
+  // ==================== 2026 (July - December) ====================
+  if (year == 2026 && m == 7 && d == 29) return {1, {"GURU PURNIMA"}};
+  if (year == 2026 && m == 8 && d == 17) return {1, {"NAG PANCHAMI"}};
+  if (year == 2026 && m == 8 && d == 28) return {1, {"RAKSHA BANDHAN"}};
+  if (year == 2026 && m == 9 && d == 3) return {1, {"KRISHNA JANMASHTAMI"}};
+  if (year == 2026 && m == 9 && d == 4) return {1, {"KRISHNA JANMASHTAMI"}};
+  if (year == 2026 && m == 9 && d == 14) return {1, {"GANESH CHATURTHI"}};
+  if (year == 2026 && m == 10 && d == 11) return {1, {"MAA SHAILPUTRI"}};
+  if (year == 2026 && m == 10 && d == 12) return {1, {"MAA BRAHMACHARINI"}};
+  if (year == 2026 && m == 10 && d == 13) return {1, {"MAA CHANDRAGHANTA"}};
+  if (year == 2026 && m == 10 && d == 14) return {1, {"MAA KUSHMANDA"}};
+  if (year == 2026 && m == 10 && d == 15) return {1, {"MAA SKANDAMATA"}};
+  if (year == 2026 && m == 10 && d == 16) return {1, {"MAA KATYAYANI"}};
+  if (year == 2026 && m == 10 && d == 17) return {1, {"MAA KALARATRI"}};
+  if (year == 2026 && m == 10 && d == 18) return {1, {"MAHA ASHTAMI"}};
+  if (year == 2026 && m == 10 && d == 19) return {1, {"MAHA NAVAMI"}};
+  if (year == 2026 && m == 10 && d == 20) return {1, {"VIJAYADASHAMI"}};
+  if (year == 2026 && m == 10 && d == 29) return {1, {"KARWA CHAUTH"}};
+  if (year == 2026 && m == 11 && d == 7) return {1, {"DHANTERAS"}};
+  if (year == 2026 && m == 11 && d == 8) return {1, {"HAPPY DIWALI"}};
+  if (year == 2026 && m == 11 && d == 9) return {1, {"GOVARDHAN PUJA"}};
+  if (year == 2026 && m == 11 && d == 11) return {1, {"BHAI DOOJ"}};
+  if (year == 2026 && m == 11 && d == 15) return {1, {"CHHATH PUJA"}};
+  if (year == 2026 && m == 11 && d == 16) return {1, {"CHHATH PUJA"}};
+
+  // ==================== 2027 (Full Year) ====================
+  if (year == 2027 && m == 1 && d == 15) return {1, {"MAKAR SANKRANTI"}};
+  if (year == 2027 && m == 2 && d == 11) return {1, {"VASANT PANCHAMI"}};
+  if (year == 2027 && m == 3 && d == 6) return {1, {"MAHASHIVRATRI"}};
+  if (year == 2027 && m == 3 && d == 23) return {1, {"HOLIKA DAHAN"}};
+  if (year == 2027 && m == 3 && d == 24) return {1, {"HAPPY HOLI"}};
+  if (year == 2027 && m == 4 && d == 8) return {1, {"CHAITRA NAVRATRI"}};
+  if (year == 2027 && m == 4 && d == 16) return {1, {"RAM NAVAMI"}};
+  if (year == 2027 && m == 4 && d == 22) return {1, {"HANUMAN JAYANTI"}};
+  if (year == 2027 && m == 5 && d == 10) return {1, {"AKSHAYA TRITIYA"}};
+  if (year == 2027 && m == 5 && d == 21) return {1, {"BUDDHA PURNIMA"}};
+  if (year == 2027 && m == 7 && d == 18) return {1, {"GURU PURNIMA"}};
+  if (year == 2027 && m == 8 && d == 7) return {1, {"NAG PANCHAMI"}};
+  if (year == 2027 && m == 8 && d == 18) return {1, {"RAKSHA BANDHAN"}};
+  if (year == 2027 && m == 8 && d == 26) return {1, {"KRISHNA JANMASHTAMI"}};
+  if (year == 2027 && m == 9 && d == 6) return {1, {"GANESH CHATURTHI"}};
+  if (year == 2027 && m == 10 && d == 1) return {1, {"MAA SHAILPUTRI"}};
+  if (year == 2027 && m == 10 && d == 2) return {1, {"MAA BRAHMACHARINI"}};
+  if (year == 2027 && m == 10 && d == 3) return {1, {"MAA CHANDRAGHANTA"}};
+  if (year == 2027 && m == 10 && d == 4) return {1, {"MAA KUSHMANDA"}};
+  if (year == 2027 && m == 10 && d == 5) return {1, {"MAA SKANDAMATA"}};
+  if (year == 2027 && m == 10 && d == 6) return {1, {"MAA KATYAYANI"}};
+  if (year == 2027 && m == 10 && d == 7) return {1, {"MAA KALARATRI"}};
+  if (year == 2027 && m == 10 && d == 8) return {1, {"MAHA ASHTAMI"}};
+  if (year == 2027 && m == 10 && d == 9) return {1, {"MAHA NAVAMI"}};
+  if (year == 2027 && m == 10 && d == 11) return {1, {"VIJAYADASHAMI"}};
+  if (year == 2027 && m == 10 && d == 19) return {1, {"KARWA CHAUTH"}};
+  if (year == 2027 && m == 10 && d == 28) return {1, {"DHANTERAS"}};
+  if (year == 2027 && m == 10 && d == 29) return {1, {"HAPPY DIWALI"}};
+  if (year == 2027 && m == 10 && d == 30) return {1, {"GOVARDHAN PUJA"}};
+  if (year == 2027 && m == 11 && d == 1) return {1, {"BHAI DOOJ"}};
+  if (year == 2027 && m == 11 && d == 5) return {1, {"CHHATH PUJA"}};
+  if (year == 2027 && m == 11 && d == 6) return {1, {"CHHATH PUJA"}};
+  if (year == 2027 && m == 11 && d == 7) return {1, {"CHHATH PUJA"}};
+  if (year == 2027 && m == 11 && d == 8) return {1, {"CHHATH PUJA"}};
+
+  // ==================== Family Events (Year Independent) ====================
+  if (m == 4 && d == 22) return {3, {"HAPPY MARRIAGE", "ANNIVERSARY", "BHAIYA & BHABHI"}};
+  if (m == 6 && d == 6)  return {4, {"HAPPY MARRIAGE", "ANNIVERSARY", "SARITA DIDI &", "NIRANJAN JIJA"}};
+  if (m == 3 && d == 29) return {2, {"HAPPY BIRTHDAY", "SWARA PANDIT"}};
+  if (m == 3 && d == 13) return {2, {"HAPPY BIRTHDAY", "RIYANSH PANDIT"}};
+  if (m == 9 && d == 19) return {2, {"HAPPY BIRTHDAY", "SONALI PANDIT"}};
+  if (m == 7 && d == 30) return {2, {"HAPPY BIRTHDAY", "ANKIT PANDIT"}};
+  if (m == 8 && d == 5)  return {2, {"HAPPY BIRTHDAY", "SUNNY PANDIT"}};
+  if (m == 12 && d == 10) return {2, {"HAPPY BIRTHDAY", "AAYUSH PANDIT"}};
+  if (m == 12 && d == 9)  return {2, {"HAPPY BIRTHDAY", "SOHANI PANDIT"}};
+  if (m == 1  && d == 5)  return {2, {"HAPPY BIRTHDAY", "SONU PANDIT"}};
+  
+  return {0, {}};
+}
+
+// ==================== NIGHT CLOCK MODE ====================
+bool nightClockMode = false;
+unsigned long nightClockDelay = 0;
+
+// ==================== UI ANIMATION ====================
+float wavePhase = 0;
+int dropX[3] = {18,22,26};
+int dropY[3] = {40,35,45};
+int dropSpd[3] = {1,2,1};
+int clockMode = 0;
+
+// ==================== BUTTON DEBOUNCE ====================
+bool lastBtn1State = HIGH;
+bool lastBtn2State = HIGH;
+bool lastBtn3State = HIGH;
+bool lastBtn4State = HIGH;
+bool lastBtn5State = HIGH;
+
+unsigned long btnTime1 = 0;
+unsigned long btnTime2 = 0;
+unsigned long btnTime3 = 0;
+unsigned long btnTime4 = 0;
+unsigned long btnTime5 = 0;
+
+const int debounceTime = 30;
+
+// ==================== ULTRASONIC ====================
+volatile unsigned long pulseStartTime = 0;
+volatile unsigned long pulseDuration = 0;
+volatile bool pulseComplete = false;
+volatile bool measuring = false;
+
+bool measurementInProgress = false;
+unsigned long measurementStartMicros = 0;
+unsigned long lastMeasurementTime = 0;
+
+const unsigned long MEASUREMENT_INTERVAL_MS = 200;
+const unsigned long MIN_VALID_DURATION = 100;
+const unsigned long MAX_VALID_DURATION = 8000;
+
+// ==================== FORWARD DECLARATIONS ====================
+void sendTelegramMessage(String msg);
+void sendMotorNotification();
+void sendStartupMessage();
+void sendMenu(String chat_id);
+void handleTelegram();
+void telegramTask(void *pvParameters);
+void startCustomTimer(String input);
+int parseTimeSmart(String input);
+bool isLightAvailable();
+bool isBottomDry();
+bool isTopDry();
+bool isBottomWet();
+bool isTopWet();
+bool isWaterAvailable();
+bool isTankFull();
+void checkAndHandleLightCut();
+void checkAndHandleTankSensors();
+unsigned long getBootCount();
+void incrementBootCount();
+void buzzerBeep(int duration, int repeat, int delayMs);
+bool isNightMode();
+void autoModeManager();
+
+// ==================== BUZZER ====================
+void buzzerBeep(int duration, int repeat, int delayMs) {
+    for (int i = 0; i < repeat; i++) {
+        digitalWrite(BUZZER_PIN, HIGH);
+        delay(duration);
+        digitalWrite(BUZZER_PIN, LOW);
+        if (i < repeat - 1) delay(delayMs);
+    }
+}
+
+// ==================== EEPROM ====================
+unsigned long getBootCount() {
+  unsigned long count;
+  EEPROM.get(EE_BOOT_COUNT, count);
+  if (count == 0xFFFFFFFF || count == 0) return 1;
+  return count;
+}
+
+void incrementBootCount() {
+  unsigned long count = getBootCount();
+  count++;
+  EEPROM.put(EE_BOOT_COUNT, count);
+  EEPROM.commit();
+}
+
+// ==================== LDR ====================
+bool isLightAvailable() { return digitalRead(LDR_PIN) == LOW; }
+
+// ==================== CHECK AND HANDLE LIGHT CUT (FIXED - WITH RESET) ====================
+void checkAndHandleLightCut() {
+    static bool lastLightState = true;
+    bool currentLight = isLightAvailable();
+    
+    // Light gayi (HIGH)
+    if (!currentLight && lastLightState) {
+        if (lightLostTime == 0) {
+            lightLostTime = millis();
+        }
+        lightStopwatchRunning = true;
+        lightNotAvailableStart = millis();
+        lastLightAvailableTime = 0;
+    }
+    
+    // ==================== LIGHT WAPAS AAYI (LOW) ====================
+    if (currentLight && !lastLightState) {
+        
+        // ==================== RESET LIGHT OFFLINE TELEGRAM CYCLE ====================
+        firstLightOffMsgSent = false;
+        lastLightOffMsgTime = 0;
+        
+        if (lightStopwatchRunning) {
+            unsigned long duration = millis() - lightLostTime;
+            
+            if (duration >= 12600000UL && !isTankFull()) {
+                sys.stopFlag = false;
+                sys.forceFlag = false;
+                sys.timerType = AUTO_TANK_MODE;
+                sys.motor = true;
+                strcpy(notificationMsg, "RUNNING");
+                if (wifiConnected) {
+                    static unsigned long lastLightBackMsgTime = 0;
+                    if (millis() - lastLightBackMsgTime > 4000) {
+                        unsigned long totalSeconds = duration / 1000;
+                        int hours = totalSeconds / 3600;
+                        int mins = (totalSeconds % 3600) / 60;
+                        
+                        String timeText = "";
+                        if (hours > 0) {
+                            timeText += String(hours) + " hour";
+                            if (hours > 1) timeText += "s";
+                        }
+                        if (mins > 0) {
+                            if (timeText.length()) timeText += " ";
+                            timeText += String(mins) + " min";
+                        }
+                        if (timeText == "") timeText = "few seconds";
+                        
+                        String msg = "🔆 Light " + timeText + " baad wapas aayi! Motor AUTO ON";
+                        sendTelegramMessage(msg);
+                        lastLightBackMsgTime = millis();
+                    }
+                }
+                autoStartMessageSent = true;
+                digitalWrite(RELAY_PIN, LOW);
+            }
+            
+            lightStopwatchRunning = false;
+            lightLostTime = 0;
+        }
+        lightNotAvailableStart = 0;
+        lastLightAvailableTime = millis();
+    }
+    
+    // Motor OFF on light cut
+    if (sys.motor && !currentLight && lastLightState) {
+        sys.motor = false;
+        if (sys.timerType != 99 && sys.timerType != AUTO_TANK_MODE) {
+            sys.forceFlag = false;
+            sys.timerType = 0;
+            sys.timerEndTime = 0;
+            sys.customTimerSeconds = 0;
+        }
+        strcpy(notificationMsg, "LIGHT CUT");
+        lightCutMessageShowing = true;
+        lastLightCutTime = millis();
+        noLightMessageShowing = false;
+        waitingForLightReturn = false;
+        if (wifiConnected) {
+            static unsigned long lastLightCutMsgTime = 0;
+            if (millis() - lastLightCutMsgTime > 4000) {
+                sendTelegramMessage("⚡ LIGHT CUT! Motor Band Ho Gaya");
+                lastLightCutMsgTime = millis();
+            }
+        }
+    }
+    
+    // Light wapas aayi - display clear
+    if (currentLight && !lastLightState) {
+        if (sys.timerType == 99 && !lightCutMessageShowing && !waitingForLightReturn) {
+            waitingForLightReturn = true;
+            lightReturnTime = millis();
+            strcpy(notificationMsg, "LIGHT BACK");
+        }
+    }
+    
+    if (waitingForLightReturn) {
+        if (!isLightAvailable()) {
+            waitingForLightReturn = false;
+            if (!sys.motor && !sys.stopFlag && !tankFullMessageShowing && !lightCutMessageShowing)
+                strcpy(notificationMsg, "READY");
+        } else if ((millis() - lightReturnTime) > 2000) {
+            waitingForLightReturn = false;
+            if (sys.timerType == 99 && !isTankFull() && isLightAvailable()) {
+                sys.motor = true;
+                strcpy(notificationMsg, "RUNNING");
+                if (wifiConnected) {
+                    static unsigned long lastLightBackMsgTime = 0;
+                    if (millis() - lastLightBackMsgTime > 4000) {
+                        sendTelegramMessage("💡 Light 2 sec stable rahi → Motor ON (Auto)");
+                        lastLightBackMsgTime = millis();
+                    }
+                }
+                autoStartMessageSent = true;
+                digitalWrite(RELAY_PIN, LOW);
+            } else if (!lightCutMessageShowing && !tankFullMessageShowing && !noLightMessageShowing)
+                strcpy(notificationMsg, "READY");
+        }
+    }
+    
+    if (lightCutMessageShowing && (millis() - lastLightCutTime) > 3000) {
+        lightCutMessageShowing = false;
+        if (!sys.motor && !sys.stopFlag && !tankFullMessageShowing && !waitingForLightReturn)
+            strcpy(notificationMsg, "READY");
+    }
+    if (noLightMessageShowing && (millis() - noLightMsgStartTime) > 3000) {
+        noLightMessageShowing = false;
+        if (!sys.motor && !sys.stopFlag && !lightCutMessageShowing && !tankFullMessageShowing)
+            strcpy(notificationMsg, "READY");
+    }
+    lastLightState = currentLight;
+}
+
+// ==================== AUTO MODE MANAGER (FIXED - 4 CONDITIONS) ====================
+void autoModeManager() {
+    bool bottomLow = digitalRead(TANK_LOW_PIN) == LOW;
+    bool topLow    = digitalRead(TANK_HIGH_PIN) == LOW;
+
+    // ==================== CONDITION 1: BOTH HIGH = LOW WATER ====================
+    // Auto ON - Motor start karo
+    if (!bottomLow && !topLow) {
+        sys.motor = true;
+        return;
+    }
+
+    // ==================== CONDITION 2: BOTTOM LOW + TOP HIGH ====================
+    // Motor continue ONLY if it was already ON
+    // Startup par No Action (auto start nahi karega)
+    if (bottomLow && !topLow) {
+        // Motor ko current state mein rehne do
+        // Agar ON hai toh ON rahega, agar OFF hai toh OFF rahega
+        // NAYI start nahi karega
+        
+        autoStartPending = false;
+        telegramPending = false;
+        displayLowWater = false;
+        lowWaterWarningActive = false;
+
+        if (!sys.stopFlag && !sys.motor) {
+            strcpy(notificationMsg, "READY");
+        }
+        return;
+    }
+
+    // ==================== CONDITION 3: BOTH LOW = TANK FULL ====================
+    if (bottomLow && topLow) {
+        sys.motor = false;
+        return;
+    }
+
+    // ==================== CONDITION 4: BOTTOM HIGH + TOP LOW ====================
+    // Transition/Safety state - Motor OFF
+    if (!bottomLow && topLow) {
+        sys.motor = false;
+        autoStartPending = false;
+        telegramPending = false;
+        displayLowWater = false;
+        lowWaterWarningActive = false;
+
+        if (!sys.stopFlag) {
+            strcpy(notificationMsg, "READY");
+        }
+        return;
+    }
+
+    // Safety
+    sys.motor = false;
+}
+
+// ==================== CHECK AND HANDLE TANK SENSORS (FIXED - 4 CONDITIONS + GLOBAL RESET) ====================
+void checkAndHandleTankSensors() {
+    static bool lastMotorState = false;
+    static bool tankFullMsgSent = false;
+    static bool lowWaterMsgSent = false;
+    
+    bool lowSensor  = digitalRead(TANK_LOW_PIN) == LOW;
+    bool highSensor = digitalRead(TANK_HIGH_PIN) == LOW;
+
+    // ==================== AUTO TANK START BLOCK CHECK ====================
+    if (autoTankStartBlocked) {
+        if ((millis() - autoModeBlockedTime) >= 600000UL) {
+            if (!(lowSensor && highSensor)) {
+                autoTankStartBlocked = false;
+            }
+        }
+    }
+
+    // ==================== CONDITION 3: BOTH LOW = TANK FULL ====================
+    if (lowSensor && highSensor) {
+
+        autoStartPending = false;
+        telegramPending = false;
+        lowWaterMsgSent = false;
+
+        if (sys.timerType == 99 ||
+            sys.timerType == AUTO_TANK_MODE ||
+            sys.timerType == 2 ||
+            sys.timerType == 3) {
+
+            sys.motor = false;
+            sys.timerType = 0;
+            sys.timerEndTime = 0;
+            sys.customTimerSeconds = 0;
+            sys.stopFlag = false;
+
+            strcpy(notificationMsg, "TANK FULL");
+            tankFullMessageShowing = true;
+            lastTankFullTime = millis();
+
+            displayLowWater = false;
+            lowWaterWarningActive = false;
+
+            autoStartPending = false;
+            telegramPending = false;
+
+            buzzerBeep(500, 1, 0);
+            
+            if (wifiConnected) {
+                if (!tankFullMsgSent) {
+                    String tankFullMsgs[] = {
+                        "🎉 Tank FULL!\nMission Complete! 🥳\nMotor ne duty khatam karke OFF le liya. 😎",
+                        "😎 Boss!\nTank ne bola,\n\"Bas... ab ek boond bhi nahi!\" 🤣\nMotor AUTO OFF.",
+                        "🤭 Breaking News!\n🚰 Tank FULL\n⚙️ Motor AUTO OFF\n💧 Overflow ka plan cancel! 😂",
+                        "🙄 Oye Hero!\nTank already FULL ho gaya...\nMotor ko overwork mat karwao! 😅",
+                        "😂 Achievement Unlocked!\n🏆 Tank Successfully Filled\n⚙️ Motor AUTO OFF",
+                        "😴 Motor boli...\n\"Kaam khatam! Ab thoda aaram karne do.\" 🤣",
+                        "🥳 Congratulations!\nTank FULL ho gaya...\nMotor ne khud hi retirement le li... filhaal ke liye! 😂",
+                        "🫡 Mission Accomplished!\nTank 100% FULL ✅\nMotor AUTO OFF 🛑",
+                        "😜 Good News!\nTank khush... Motor khush...\nAb sirf tum chai piyo! ☕😂",
+                        "🚫 Overflow Avoided!\nTank FULL ✅\nMotor AUTO OFF 😎\nSab kuch control mein hai! 🎉"
+                    };
+                    static int msgIndex = 0;
+                    sendTelegramMessage(tankFullMsgs[msgIndex]);
+                    msgIndex++;
+                    if (msgIndex > 9) msgIndex = 0;
+                    tankFullMsgSent = true;
+                }
+            }
+        }
+
+        return;
+    }
+
+    // ==================== CONDITION 2: BOTTOM LOW + TOP HIGH ====================
+    // Motor continue ONLY if already ON - NO new start
+    if (lowSensor && !highSensor) {
+
+        autoStartPending = false;
+        telegramPending = false;
+
+        displayLowWater = false;
+        lowWaterWarningActive = false;
+        lowWaterMsgSent = false;
+
+        if (!sys.stopFlag && !sys.motor) {
+            strcpy(notificationMsg, "READY");
+        }
+
+        return;
+    }
+
+    // ==================== CONDITION 4: BOTTOM HIGH + TOP LOW ====================
+    // Transition/Safety state - Motor OFF
+    if (!lowSensor && highSensor) {
+
+        autoStartPending = false;
+        telegramPending = false;
+
+        displayLowWater = false;
+        lowWaterWarningActive = false;
+        lowWaterMsgSent = false;
+
+        if (!sys.stopFlag) {
+            strcpy(notificationMsg, "READY");
+        }
+
+        sys.motor = false;
+        return;
+    }
+
+    // ==================== CONDITION 1: BOTH HIGH = LOW WATER ====================
+    if (!lowSensor && !highSensor) {
+
+        // ==================== LIGHT NOT AVAILABLE ====================
+        if (!isLightAvailable()) {
+            sys.motor = false;
+
+            autoStartPending = false;
+            telegramPending = false;
+
+            displayLowWater = true;
+            lowWaterWarningActive = true;
+
+            strcpy(notificationMsg, "LOW WATER");
+            
+            // ==================== TELEGRAM LIGHT OFFLINE MESSAGES ====================
+            // firstLightOffMsgSent and lastLightOffMsgTime are now GLOBAL variables
+            
+            if (wifiConnected && !firstLightOffMsgSent) {
+                firstLightOffMsgSent = true;
+                alertStartTime = millis();
+                lastLightOffMsgTime = millis();
+                
+                String msg = "💡 Light: Offline since 0 min";
+                msg += "\n     Light: Out of Coverage Area 📵";
+                msg += "\n     Tank Low Water Detect 💧";
+                sendTelegramMessage(msg);
+            }
+            
+            if (wifiConnected && firstLightOffMsgSent && (millis() - lastLightOffMsgTime) >= TELEGRAM_REPEAT_INTERVAL) {
+                lastLightOffMsgTime = millis();
+                unsigned long elapsedMs = millis() - lightLostTime;
+                unsigned long elapsedMinutes = elapsedMs / 60000;
+                
+                int hours = elapsedMinutes / 60;
+                int mins = elapsedMinutes % 60;
+                
+                String timeText = "";
+                
+                if (hours > 0) {
+                    timeText += String(hours) + " hour";
+                    if (hours > 1) timeText += "s";
+                }
+                
+                if (mins > 0) {
+                    if (timeText.length()) timeText += " ";
+                    timeText += String(mins) + " min";
+                }
+                
+                String msg = "💡 Light: Offline since " + timeText;
+                msg += "\n     Light: Out of Coverage Area 📵";
+                msg += "\n     Tank Low Water Detect 💧";
+                sendTelegramMessage(msg);
+                buzzerBeep(200, 1, 0);
+            }
+            
+            return;
+        }
+
+        // ==================== BOOT DELAY ====================
+        if (bootDelayActive) {
+            if (millis() - bootTime < 30000) {
+                displayLowWater = true;
+                lowWaterWarningActive = true;
+                return;
+            }
+            bootDelayActive = false;
+        }
+
+        // ==================== START 30-SECOND PENDING TIMER ====================
+        if (!sys.motor &&
+            !autoTankStartBlocked &&
+            !autoStartPending) {
+
+            autoStartPending = true;
+            autoStartTime = millis();
+
+            displayLowWater = true;
+            lowWaterWarningActive = true;
+
+            strcpy(notificationMsg, "LOW WATER");
+            
+            if (wifiConnected && !lowWaterMsgSent) {
+                String lowWaterMsgs[] = {
+                    "😰 Alert! Paani khatam!",
+                    "🚨 Tank Empty! Motor ready to start...",
+                    "💧 Low Water! Wait 30 sec...",
+                    "😱 Emergency! Paani nahi hai!",
+                    "🆘 Tank needs water! ⏳ 30 sec..."
+                };
+                static int msgIndex = 0;
+                sendTelegramMessage(lowWaterMsgs[msgIndex]);
+                msgIndex++;
+                if (msgIndex > 4) msgIndex = 0;
+                lowWaterMsgSent = true;
+            }
+        }
+
+        // ==================== 30 SECONDS COMPLETED - AUTO ON ====================
+        if (autoStartPending &&
+            (millis() - autoStartTime >= 30000UL)) {
+
+            autoStartPending = false;
+
+            sys.stopFlag = false;
+            sys.forceFlag = false;
+            sys.timerType = AUTO_TANK_MODE;
+            sys.motor = true;
+
+            strcpy(notificationMsg, "RUNNING");
+
+            digitalWrite(RELAY_PIN, LOW);
+
+            telegramPending = true;
+            telegramTime = millis();
+            
+            lowWaterMsgSent = false;
+        }
+
+        return;
+    }
+
+    // Safety fallback
+    sys.motor = false;
+}
+
+// ==================== SMART TIME PARSER ====================
+int parseTimeSmart(String input) {
+    input.trim();
+    input.toLowerCase();
+    input.replace(" ", "");
+    input.replace("minutes", "m");
+    input.replace("minute", "m");
+    input.replace("minite", "m");
+    input.replace("mint", "m");
+    input.replace("min", "m");
+    input.replace("seconds", "s");
+    input.replace("second", "s");
+    input.replace("seco", "s");
+    input.replace("sec", "s");
+
+    if (input.indexOf('.') != -1 && (input.endsWith("m") || input.endsWith("s"))) {
+        int dot = input.indexOf('.');
+        String mStr = input.substring(0, dot);
+        String sStr = input.substring(dot + 1, input.length() - 1);
+        if (mStr.length() == 0 || sStr.length() == 0) return -1;
+        int m = mStr.toInt();
+        int s = sStr.toInt();
+        if (s >= 60) return -1;
+        return m * 60 + s;
+    }
+    if (input.indexOf(':') != -1) {
+        int colon = input.indexOf(':');
+        int m = input.substring(0, colon).toInt();
+        int s = input.substring(colon + 1).toInt();
+        if (s >= 60) return -1;
+        return m * 60 + s;
+    }
+    int total = 0, num = 0;
+    bool hasAny = false;
+    for (int i = 0; i < input.length(); i++) {
+        char c = input[i];
+        if (isDigit(c)) { num = num * 10 + (c - '0'); hasAny = true; }
+        else if (c == 'm') { total += num * 60; num = 0; }
+        else if (c == 's') { total += num; num = 0; }
+        else return -1;
+    }
+    if (num > 0) total += num;
+    if (!hasAny || total <= 0) return -1;
+    return total;
+}
+
+// ==================== CUSTOM TIMER ====================
+void startCustomTimer(String input) {
+    int seconds = parseTimeSmart(input);
+    if (seconds <= 0) {
+        if (wifiConnected) {
+            String invalidTimeMsgs[] = {
+                "🙄 Oye Genius!\nYe kaunsa time format hai?\nMujhe bhi samjha do! 😂",
+                "🤦 Arre Ustaad!\nTime likho... secret code nahi! 🤣",
+                "😅 Boss...\nMera calculator bhi confuse ho gaya! 😵‍💫",
+                "😏 Sir...\nNASA ka launch code nahi...\nBas 2m30s ya 90s likhna tha! 🚀😂",
+                "🫣 Kya type kar diya?\nKeyboard fisal gaya tha kya? 🤭",
+                "😂 Bhai...\nAisa time to calendar bhi accept na kare! 📅🤣",
+                "😎 Hero!\nMujhe future predict nahi karna...\nValid time bhejo! ⏳😂",
+                "🙃 Error 404:\nSamajh mein aane wala time not found! 🤣",
+                "🤔 Itna creative mat bano...\n2m30s, 90s, 2:30 ya 120 likho! 😂",
+                "😜 Sir!\nEnglish bhi 😭 rahi hai aur timer bhi...\nEk valid time bhej do! 🤣"
+            };
+            static int msgIndex = 0;
+            sendTelegramMessage(invalidTimeMsgs[msgIndex]);
+            msgIndex++;
+            if (msgIndex > 9) msgIndex = 0;
+        }
+        return;
+    }
+    if (seconds > 3600) {
+        if (wifiConnected) sendTelegramMessage("Max 3600 seconds");
+        return;
+    }
+    if (!isLightAvailable()) {
+        if (wifiConnected) {
+            String lightOffTimerMsgs[] = {
+                "😂 Bhai!\nLight nahi hai to timer kahan se chale?",
+                "😅 Light OFF!\nTimer ko bhi light chahiye! ⚡",
+                "🤦 Oye Ustaad!\nPehle light aane do, phir timer start karenge!",
+                "😏 Sir! Timer ready hai...\nPar light ne join nahi kiya!",
+                "🤣 Breaking News!\nLight ne timer start karne se mana kar diya!"
+            };
+            static int msgIndex = 0;
+            sendTelegramMessage(lightOffTimerMsgs[msgIndex]);
+            msgIndex++;
+            if (msgIndex > 4) msgIndex = 0;
+        }
+        noLightMessageShowing = true;
+        noLightMsgStartTime = millis();
+        strcpy(notificationMsg, "NO LIGHT");
+        buzzerBeep(300, 1, 0);
+        return;
+    }
+    if (isTankFull()) {
+        if (wifiConnected) sendTelegramMessage("Tank FULL! Cannot start");
+        tankFullMessageShowing = true;
+        lastTankFullTime = millis();
+        strcpy(notificationMsg, "TANK FULL");
+        buzzerBeep(300, 1, 0);
+        return;
+    }
+    sys.stopFlag = false;
+    sys.forceFlag = false;
+    sys.timerType = 3;
+    sys.customTimerSeconds = seconds;
+    sys.timerEndTime = millis() + (seconds * 1000UL);
+    sys.motor = true;
+    sys.motorStartTime = millis();
+    buzzerBeep(50, 1, 0);
+    digitalWrite(RELAY_PIN, LOW);
+    if (wifiConnected) {
+        int mins = seconds / 60, secs = seconds % 60;
+        String timeStr = (mins > 0 ? String(mins) + " min " : "") + (secs > 0 ? String(secs) + " sec" : "");
+        if (timeStr == "") timeStr = String(seconds) + " sec";
+        sendTelegramMessage("⌛Running for: " + timeStr);
+    }
+}
+
+// ==================== TELEGRAM ====================
+void sendTelegramMessage(String msg) {
+    if (!wifiConnected || telegramQueue == NULL) return;
+    
+    UBaseType_t queueItems = uxQueueMessagesWaiting(telegramQueue);
+    
+    if (queueItems > 10) {
+        Serial.println("⚠️ Queue almost full! Clearing old messages...");
+        char dummyMsg[160];
+        while (uxQueueMessagesWaiting(telegramQueue) > 3) {
+            xQueueReceive(telegramQueue, &dummyMsg, 0);
+        }
+    }
+    
+    char buf[160];
+    msg.toCharArray(buf, 160);
+    
+    if (xQueueSend(telegramQueue, &buf, 0) != pdTRUE) {
+        Serial.println("❌ Queue full! Message dropped: " + msg);
+        char dummyMsg[160];
+        while (uxQueueMessagesWaiting(telegramQueue) > 5) {
+            xQueueReceive(telegramQueue, &dummyMsg, 0);
+        }
+        xQueueSend(telegramQueue, &buf, 0);
+    }
+}
+
+void sendMenu(String chat_id) {
+    String keyboardJson =
+        "[[\"SMART MANUAL 🧠\",\"STOP 🚫\"],"
+        "[\"30 SECOND ⏳\",\"8 MINUTE ⏳\"],"
+        "[\"FORCE ON🟢\",\"CUSTOM TIMER⌛\"],"
+        "[\"STATUS💫\",\"/menu\"]]";
+    bot.sendMessageWithReplyKeyboard(chat_id, "Developer Sunny Pandit 🐦\nCo Developer Aarohi Pandit 🌸", "", keyboardJson, true);
+}
+
+void sendMotorNotification() {
+    if (!wifiConnected) return;
+    String msg = sys.motor ? "MOTOR STARTED\nMode: " : "MOTOR STOPPED\n";
+    if (sys.motor) {
+        if (sys.forceFlag) msg += "OVERRIDE";
+        else if (sys.timerType == 1) msg += "Timer 30 Sec";
+        else if (sys.timerType == 2) msg += "Timer 8 Min";
+        else if (sys.timerType == 3) msg += "Custom Timer";
+        else if (sys.timerType == AUTO_TANK_MODE) msg += "AUTO MODE";
+        else if (sys.timerType == 99) msg += "Smart Manual (Auto)";
+        else msg += "Manual";
+        msg += "\nLevel: " + String((int)(aiLevel + 0.5)) + "%";
+    } else {
+        msg += "\nFinal Level: " + String((int)(aiLevel + 0.5)) + "%";
+    }
+    sendTelegramMessage(msg);
+}
+
+void sendStartupMessage() {
+    if (!wifiConnected) return;
+    String msg = "System ONLINE\nWiFi: Connected\nLevel: " + String((int)(aiLevel + 0.5)) + "%\nSend /menu for controls";
+    sendTelegramMessage(msg);
+}
+
+void handleTelegram() {
+    if (!wifiConnected || telegramBusy) return;
+    telegramBusy = true;
+    int numNewMessages = bot.getUpdates(bot.last_message_received + 1);
+    static int lastMsgId = 0;
+    if (numNewMessages > 0) {
+        for (int i = 0; i < numNewMessages && i < 5; i++) {
+            int msgId = bot.messages[i].update_id;
+            if (msgId == lastMsgId) continue;
+            lastMsgId = msgId;
+            String text = bot.messages[i].text;
+            String chat_id = bot.messages[i].chat_id;
+            text.trim();
+            String lowerText = text;
+            lowerText.toLowerCase();
+            if (waitingForCustomTimer && chat_id == customTimerChatId) {
+                waitingForCustomTimer = false;
+                startCustomTimer(text);
+                continue;
+            }
+            if (lowerText == "/start" || lowerText == "/menu" || lowerText == "menu") {
+                sendMenu(chat_id);
+            }
+            else if (lowerText == "status💫" || lowerText == "status") {
+                String level = String((int)(aiLevel + 0.5)) + "%";
+                String motorStatus = sys.motor ? "🏃 Running" : "😴 OFF";
+                String autoStatus = autoTankStartBlocked ? "❌ OFF" : "✅ ON";
+                String wifiStatus = wifiConnected ? "✅ Connected" : "❌ Disconnected";
+                
+                String lightStatus;
+                String lastSeen = "";
+                
+                if (isLightAvailable()) {
+                    lightStatus = "✅ Available";
+                } else {
+                    lightStatus = "❌ Not Available";
+                    unsigned long t = (millis() - lightLostTime) / 1000;
+                    int h = t / 3600;
+                    int m = (t % 3600) / 60;
+                    int s = t % 60;
+                    
+                    if (h > 0)
+                        lastSeen = String(h) + "h " + String(m) + "m " + String(s) + "s";
+                    else if (m > 0)
+                        lastSeen = String(m) + "m " + String(s) + "s";
+                    else
+                        lastSeen = String(s) + "s";
+                }
+                
+                String msg = "📊 Tank Report Card 😎\n\n";
+                msg += "💧 Water Level : " + level + "\n";
+                msg += "⚙️ Motor   : " + motorStatus + "\n";
+                msg += "🤖 Auto Mode   : " + autoStatus + "\n";
+                if (isLightAvailable()) {
+                    msg += "💡 Light    : ✅ Available\n";
+                } else {
+                    msg += "💡 Light     : ❌ Not Available\n";
+                    msg += "🕒 Last Seen   : " + lastSeen + " ago\n";
+                }
+                msg += "📶 Wi-Fi    : " + wifiStatus;
+                
+                bot.sendMessage(chat_id, msg, "");
+            }
+            else if (lowerText == "force on🟢" || lowerText == "on") {
+                waitingForCustomTimer = false;
+                if (!isLightAvailable()) {
+                    String lightOffMsgs[] = {
+                        "🙄 Oye Hero!\nLight hi nahi hai...\nMotor ko jadoo se chalaun kya? 😂",
+                        "😅 Boss...\nBijli gayab hai!\nMain inverter nahi hoon. ⚡🤣",
+                        "🤦 Arre Ustaad!\nPehle light bulao...\nPhir motor chalayenge! 😂",
+                        "😏 Sir...\nLight ke bina motor ON?\nItna bhi overconfidence theek nahi! 🤣",
+                        "😂 Kya baat hai!\nBijli vacation pe hai...\nMotor bhi uske saath chhutti mana rahi hai! 🌴",
+                        "🫣 Oops!\nLight OFF hai...\nMain Superman nahi hoon! 🦸‍♂️🤣",
+                        "😜 Bhai...\nGenerator samajh rakha hai kya?\nLight aane do pehle! ⚡😂",
+                        "🙃 Mission Failed!\nReason: Bijli ne saath chhod diya. 🤣",
+                        "😎 Boss!\nLight aayegi tabhi motor bhaagegi...\nAbhi sirf sapne dekh sakte hain! 😂",
+                        "🤭 Light nahi hai...\nMotor ko dhakka maar ke bhi start nahi kar sakte! 🤣"
+                    };
+                    
+                    static int msgIndex = 0;
+                    bot.sendMessage(chat_id, lightOffMsgs[msgIndex], "");
+                    msgIndex++;
+                    if (msgIndex > 9) msgIndex = 0;
+                    
+                    noLightMessageShowing = true;
+                    noLightMsgStartTime = millis();
+                    strcpy(notificationMsg, "NO LIGHT");
+                    buzzerBeep(300, 1, 0);
+                } else {
+                    sys.stopFlag = false;
+                    sys.forceFlag = true;
+                    sys.timerType = 0;
+                    sys.motor = true;
+                    digitalWrite(RELAY_PIN, LOW);
+                    bot.sendMessage(chat_id, "Running 🌊", "");
+                    buzzerBeep(50, 1, 0);
+                }
+            }
+            else if (lowerText == "stop 🚫" || lowerText == "force stop" || lowerText == "stop" || lowerText == "stop🛑") {
+                waitingForCustomTimer = false;
+                sys.stopFlag = true;
+                sys.forceFlag = false;
+                sys.timerType = 0;
+                sys.timerEndTime = 0;
+                sys.motor = false;
+                showingStopMessage = true;
+                lastStopMessageTime = millis();
+                autoStartMessageSent = false;
+                autoTankStartBlocked = true;
+                bot.sendMessage(chat_id, "FORCE STOP! 🚫", "");
+            }
+            else if (lowerText == "30 second ⏳" || lowerText == "timer 30" || lowerText == "timer30" || lowerText == "30" || lowerText == "timer 30 sec") {
+                waitingForCustomTimer = false;
+                if (!isLightAvailable()) {
+                    String lightOffTimerMsgs[] = {
+                        "😂 Bhai!\nLight nahi hai to timer kahan se chale?",
+                        "😅 Light OFF!\nTimer ko bhi light chahiye! ⚡",
+                        "🤦 Oye Ustaad!\nPehle light aane do, phir timer start karenge!",
+                        "😏 Sir! Timer ready hai...\nPar light ne join nahi kiya!",
+                        "🤣 Breaking News!\nLight ne timer start karne se mana kar diya!"
+                    };
+                    static int msgIndex = 0;
+                    bot.sendMessage(chat_id, lightOffTimerMsgs[msgIndex], "");
+                    msgIndex++;
+                    if (msgIndex > 4) msgIndex = 0;
+                    
+                    noLightMessageShowing = true;
+                    noLightMsgStartTime = millis();
+                    strcpy(notificationMsg, "NO LIGHT");
+                    buzzerBeep(300, 1, 0);
+                } else {
+                    sys.stopFlag = false;
+                    sys.forceFlag = false;
+                    sys.timerType = 1;
+                    sys.timerEndTime = millis() + 30000;
+                    sys.motor = true;
+                    digitalWrite(RELAY_PIN, LOW);
+                    bot.sendMessage(chat_id, "Running 🌊", "");
+                    buzzerBeep(50, 1, 0);
+                }
+            }
+            else if (lowerText == "8 minute ⏳" || lowerText == "timer 8m" || lowerText == "timer8m" || lowerText == "8m" || lowerText == "timer 8 min") {
+                waitingForCustomTimer = false;
+                if (!isLightAvailable()) {
+                    String lightOff8minMsgs[] = {
+                        "😅 Light OFF!\n8 minute ka timer? Pehle light lao!",
+                        "🤦 Bhai! Light aane do...\n8 minute baad kya hoga?",
+                        "🙄 Timer ready hai par light missing!",
+                        "😏 Light ke bina timer ka kya kaam?",
+                        "😂 8 min timer ki zaroorat nahi...\nLight ON karo pehle!"
+                    };
+                    static int msgIndex = 0;
+                    bot.sendMessage(chat_id, lightOff8minMsgs[msgIndex], "");
+                    msgIndex++;
+                    if (msgIndex > 4) msgIndex = 0;
+                    
+                    noLightMessageShowing = true;
+                    noLightMsgStartTime = millis();
+                    strcpy(notificationMsg, "NO LIGHT");
+                    buzzerBeep(300, 1, 0);
+                } else if (isTankFull()) {
+                    String tankFullTimerMsgs[] = {
+                        "🙄 Oye Hero!\nTank already FULL hai...\nAur kitna bharoge? 😂",
+                        "😅 Boss...\nTank bol raha hai,\n\"Bas bhai... aur nahi!\" 🤣",
+                        "🤦 Arre Ustaad!\nOverflow karwana hai kya?\nTimer cancel! 😂",
+                        "😏 Sir...\nTank FULL hai...\nPaani ka EMI nahi bharna! 🤣",
+                        "😂 Kya baat hai!\nTank already pet bhar ke baitha hai...\nMotor ko rest karne do! 😴",
+                        "🫣 Oops!\nTank ne entry dene se mana kar diya...\nJagah hi nahi bachi! 🤣",
+                        "😜 Bhai...\nAur paani daaloge to tank swimming pool ban jayega! 🏊😂",
+                        "🙃 Mission Failed!\nReason: Tank FULL...\nTimer ka koi kaam nahi! 🤣",
+                        "😎 Boss!\nMotor ready thi...\nPar tank ne bola,\n\"Full Capacity Reached!\" 😂",
+                        "🤭 Breaking News!\nTank ne officially board laga diya:\n🚫 \"No Vacancy\" 🤣"
+                    };
+                    static int msgIndex = 0;
+                    bot.sendMessage(chat_id, tankFullTimerMsgs[msgIndex], "");
+                    msgIndex++;
+                    if (msgIndex > 9) msgIndex = 0;
+                    
+                    tankFullMessageShowing = true;
+                    lastTankFullTime = millis();
+                    strcpy(notificationMsg, "TANK FULL");
+                    buzzerBeep(300, 1, 0);
+                } else {
+                    sys.stopFlag = false;
+                    sys.forceFlag = false;
+                    sys.timerType = 2;
+                    sys.timerEndTime = millis() + 480000;
+                    sys.motor = true;
+                    digitalWrite(RELAY_PIN, LOW);
+                    bot.sendMessage(chat_id, "Running 🌊", "");
+                    buzzerBeep(50, 1, 0);
+                }
+            }
+            else if (lowerText == "smart manual 🧠" || lowerText == "smart manual") {
+                waitingForCustomTimer = false;
+                if (!isLightAvailable()) {
+                    String smartManualLightOffMsgs[] = {
+                        "🙄 Oye Hero!\nLight hi nahi hai...\nSmart Manual ko jadoo se chalaun kya? 😂",
+                        "😅 Boss...\nBijli gayab hai!\nSmart Manual bhi wait kar raha hai. ⚡🤣",
+                        "🤦 Arre Ustaad!\nPehle light bulao...\nPhir Smart Manual START hoga! 😂",
+                        "😏 Sir...\nLight ke bina Smart Manual?\nItna bhi overconfidence theek nahi! 🤣",
+                        "😂 Kya baat hai!\nBijli vacation pe hai...\nSmart Manual bhi chhutti mana raha hai! 🌴",
+                        "🫣 Oops!\nLight OFF hai...\nMain Superman nahi hoon! 🦸‍♂️🤣",
+                        "😜 Bhai...\nGenerator samajh rakha hai kya?\nLight aane do pehle! ⚡😂",
+                        "🙃 Mission Failed!\nReason: Bijli ne saath chhod diya.\nSmart Manual ruk gaya! 🤣",
+                        "😎 Boss!\nLight aayegi tabhi Smart Manual chalega...\nAbhi sirf intezar karo! 😂",
+                        "🤭 Light nahi hai...\nSmart Manual ko dhakka maar ke bhi start nahi kar sakte! 🤣"
+                    };
+                    static int msgIndex = 0;
+                    bot.sendMessage(chat_id, smartManualLightOffMsgs[msgIndex], "");
+                    msgIndex++;
+                    if (msgIndex > 9) msgIndex = 0;
+                    
+                    noLightMessageShowing = true;
+                    noLightMsgStartTime = millis();
+                    strcpy(notificationMsg, "NO LIGHT");
+                    buzzerBeep(300, 1, 0);
+                } else if (isTankFull()) {
+                    tankFullMessageShowing = true;
+                    lastTankFullTime = millis();
+                    strcpy(notificationMsg, "TANK FULL");
+                    if (wifiConnected) {
+                        String tankFullSmartManualMsgs[] = {
+                            "Full matlab FULL! 😂",
+                            "Ab kya bharoge? 🤣",
+                            "Space hi nahi hai! 😅",
+                            "Chill, tank full hai. 😎",
+                            "Overachiever detected. 😂",
+                            "No vacancy! 🚫",
+                            "Bas bhai, ho gaya! 😂"
+                        };
+                        static int msgIndex = 0;
+                        bot.sendMessage(chat_id, tankFullSmartManualMsgs[msgIndex], "");
+                        msgIndex++;
+                        if (msgIndex > 6) msgIndex = 0;
+                    }
+                    buzzerBeep(300, 1, 0);
+                } else {
+                    sys.stopFlag = false;
+                    sys.forceFlag = false;
+                    sys.timerType = 99;
+                    sys.timerEndTime = 0;
+                    sys.motor = true;
+                    strcpy(notificationMsg, "RUNNING");
+                    showingStopMessage = false;
+                    autoStartMessageSent = false;
+                    digitalWrite(RELAY_PIN, LOW);
+                    bot.sendMessage(chat_id, "🧠 Smart Manual Running 🌊", "");
+                    buzzerBeep(50, 1, 0);
+                }
+            }
+            else if (lowerText == "custom timer⌛" || lowerText == "custom timer") {
+                waitingForCustomTimer = true;
+                customTimerChatId = chat_id;
+                waitingStartTime = millis();
+
+                String promptMsgs[] = {
+                    "🫡 Sir! Kitna time lagana hai?\nPerfect time? Type karo!🫣",
+                    "🙄 Itna soch kya rahe ho?\nNASA launch nahi, sirf timer set karna hai! 🚀🤣",
+                    "😎 Jaldi bolo Ustaad!\nTyping speed dekh ke lag raha hai tank khud bhar jayega! 😂\n🤦 Time enter karo!",
+                    "Itna sochoge to bucket se bharna faster hoga! 🪣😂",
+                    "😏 Kya hua? Calculator dhoond rahe ho?\nBas 2m30s ya 90s type karo, PhD nahi likhni! 🤣",
+                    "😂 Sir, itna suspense mat banao!\nTime likho... motor koi web series ka next episode nahi hai! 🎬🤣"
+                };
+
+                static int msgIndex = 0; 
+                
+                bot.sendMessage(chat_id, promptMsgs[msgIndex], "");
+
+                msgIndex++;
+                if (msgIndex > 5) {
+                    msgIndex = 0; 
+                }
+            }
+        }
+    }
+    if (waitingForCustomTimer && (millis() - waitingStartTime) > 60000) waitingForCustomTimer = false;
+    telegramBusy = false;
+}
+
+void telegramTask(void *pvParameters) {
+    char txMsg[160];
+    for (;;) {
+        unsigned long now = millis();
+        
+        if (telegramQueue != NULL) {
+            UBaseType_t queueItems = uxQueueMessagesWaiting(telegramQueue);
+            
+            if (queueItems > 12) {
+                char dummyMsg[160];
+                Serial.print("⚠️ Queue Full! Clearing ");
+                Serial.print(queueItems);
+                Serial.println(" messages...");
+                
+                while (uxQueueMessagesWaiting(telegramQueue) > 3) {
+                    if (xQueueReceive(telegramQueue, &dummyMsg, 0) == pdTRUE) {
+                        // Discard old message
+                    }
+                }
+                Serial.println("✅ Queue cleared! 3 messages reserved.");
+            }
+        }
+        
+        if (wifiConnected && telegramQueue != NULL && xQueueReceive(telegramQueue, &txMsg, 0) == pdTRUE) {
+            telegramBusy = true;
+            
+            bool sent = bot.sendMessage(CHAT_ID, String(txMsg), "");
+            if (!sent) {
+                Serial.println("❌ Send failed! Message discarded.");
+            } else {
+                Serial.print("✅ Message sent: ");
+                Serial.println(txMsg);
+            }
+            
+            telegramBusy = false;
+            vTaskDelay(800 / portTICK_PERIOD_MS);
+        }
+        
+        if (wifiConnected && ntpSynced && !telegramBusy && (now - lastTelegramCheckTime > 1200)) {
+            lastTelegramCheckTime = now;
+            handleTelegram();
+        }
+        
+        vTaskDelay(100 / portTICK_PERIOD_MS);
+    }
+}
+
+// ==================== ULTRASONIC INTERRUPT ====================
+void IRAM_ATTR echoISR() {
+    if (digitalRead(ECHO_PIN) == HIGH) {
+        pulseStartTime = micros();
+        measuring = true;
+    } else {
+        if (measuring) {
+            pulseDuration = micros() - pulseStartTime;
+            pulseComplete = true;
+            measuring = false;
+        }
+    }
+}
+
+void startUltrasonicMeasurement() {
+    digitalWrite(TRIG_PIN, LOW);
+    delayMicroseconds(2);
+    digitalWrite(TRIG_PIN, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(TRIG_PIN, LOW);
+    noInterrupts();
+    pulseComplete = false;
+    interrupts();
+    measurementStartMicros = micros();
+    measurementInProgress = true;
+}
+
+float getUltrasonicLevelPercent() {
+    unsigned long now = millis();
+    if (!measurementInProgress && (now - lastMeasurementTime) >= MEASUREMENT_INTERVAL_MS) {
+        startUltrasonicMeasurement();
+        lastMeasurementTime = now;
+        return kalmanEstimate;
+    }
+    if (measurementInProgress && (micros() - measurementStartMicros) > MAX_VALID_DURATION) {
+        measurementInProgress = false;
+        return kalmanEstimate;
+    }
+    bool isComplete = false;
+    unsigned long duration = 0;
+    noInterrupts();
+    isComplete = pulseComplete;
+    if (isComplete) {
+        duration = pulseDuration;
+        pulseComplete = false;
+    }
+    interrupts();
+    if (isComplete) {
+        measurementInProgress = false;
+        if (duration < MIN_VALID_DURATION || duration > MAX_VALID_DURATION) {
+            return kalmanEstimate;
+        }
+        float dist = duration * 0.0343 / 2.0;
+        float waterHeight = tankHeight - (dist - sensorOffset);
+        waterHeight = constrain(waterHeight, 0, tankHeight);
+        float percent = (waterHeight / tankHeight) * 100.0;
+        rawBuffer[rawIndex++] = percent;
+        if (rawIndex >= 5) rawIndex = 0;
+        if (rawReadingsCount < 5) rawReadingsCount++;
+        float sum = 0;
+        for (int i = 0; i < rawReadingsCount; i++) sum += rawBuffer[i];
+        return sum / rawReadingsCount;
+    }
+    return kalmanEstimate;
+}
+
+float kalmanUpdate(float measurement) {
+    if (!kalmanInitialized) {
+        kalmanEstimate = measurement;
+        kalmanInitialized = true;
+        return kalmanEstimate;
+    }
+    kalmanError += kalmanQ;
+    float K = kalmanError / (kalmanError + kalmanR);
+    kalmanEstimate += K * (measurement - kalmanEstimate);
+    kalmanError *= (1 - K);
+    return kalmanEstimate;
+}
+
+// ==================== WIFI ====================
+void initWiFi() {
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false);
+    WiFi.setAutoReconnect(true);
+    WiFi.persistent(true);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    wifiConnected = false;
+}
+
+void checkWiFi() {
+    static bool wasConnected = false;
+    if (WiFi.status() == WL_CONNECTED) {
+        if (!wasConnected) {
+            wasConnected = true;
+            wifiConnected = true;
+            if (!ntpSynced) {
+                configTime(19800, 0, "pool.ntp.org", "time.nist.gov");
+                struct tm timeinfo;
+                int retry = 0;
+                while (!getLocalTime(&timeinfo, 1) && retry < 5) {
+                    delay(100);
+                    retry++;
+                }
+                if (retry < 5) {
+                    ntpSynced = true;
+                    hour = timeinfo.tm_hour;
+                    minute = timeinfo.tm_min;
+                    sec = timeinfo.tm_sec;
+                    day = timeinfo.tm_mday;
+                    month = timeinfo.tm_mon + 1;
+                    year = timeinfo.tm_year + 1900;
+                    weekday = timeinfo.tm_wday;
+                }
+            }
+        }
+    } else {
+        if (wasConnected) {
+            wasConnected = false;
+            wifiConnected = false;
+        }
+    }
+    if (wifiConnected && !ntpSynced) {
+        struct tm timeinfo;
+        if (getLocalTime(&timeinfo, 1)) {
+            ntpSynced = true;
+            hour = timeinfo.tm_hour;
+            minute = timeinfo.tm_min;
+            sec = timeinfo.tm_sec;
+            day = timeinfo.tm_mday;
+            month = timeinfo.tm_mon + 1;
+            year = timeinfo.tm_year + 1900;
+            weekday = timeinfo.tm_wday;
+        }
+    }
+}
+
+// ==================== BUTTON CONTROL ====================
+void buttonControlTask() {
+    unsigned long now = millis();
+    bool currentBtn1 = digitalRead(BTN1);
+    bool currentBtn2 = digitalRead(BTN2);
+    bool currentBtn3 = digitalRead(BTN3);
+    bool currentBtn4 = digitalRead(BTN4);
+    bool currentBtn5 = digitalRead(BTN5);
+    
+    // BTN4 - FORCE STOP
+    if (currentBtn4 == LOW && lastBtn4State == HIGH && (now - btnTime4) > debounceTime) {
+        btnTime4 = now;
+        if (btnDelayActive) {
+            btnDelayActive = false;
+            pendingTimerType = 0;
+        }
+        sys.stopFlag = true;
+        sys.forceFlag = false;
+        sys.timerType = 0;
+        sys.timerEndTime = 0;
+        sys.motor = false;
+        showingStopMessage = true;
+        lastStopMessageTime = now;
+        displayLowWater = false;
+        telegramLowWaterSent = false;
+        autoStartMessageSent = false;
+        autoTankStartBlocked = true;
+        autoModeBlockedTime = millis();
+        autoStartPending = false;
+        telegramPending = false;
+    }
+    lastBtn4State = currentBtn4;
+    
+    // BTN5 - FORCE ON
+    if (currentBtn5 == LOW && lastBtn5State == HIGH && (now - btnTime5) > debounceTime) {
+        btnTime5 = now;
+        if (!isLightAvailable()) {
+            noLightMessageShowing = true;
+            noLightMsgStartTime = now;
+            strcpy(notificationMsg, "NO LIGHT");
+            buzzerBeep(300, 1, 0);
+        } else {
+            sys.stopFlag = false;
+            sys.forceFlag = true;
+            sys.timerType = 0;
+            sys.motor = true;
+            showingStopMessage = false;
+            strcpy(notificationMsg, "OVERRIDE");
+            digitalWrite(RELAY_PIN, LOW);
+            buzzerBeep(50, 1, 0);
+        }
+    }
+    lastBtn5State = currentBtn5;
+    
+    // BTN1 - 30s / 1min
+    if (currentBtn1 == LOW && lastBtn1State == HIGH && (now - btnTime1) > debounceTime) {
+        btnTime1 = now;
+        btn1PressStartTime = now;
+        btn1PressActive = true;
+        btn1LongPressTriggered = false;
+        if (!isLightAvailable()) {
+            noLightMessageShowing = true;
+            noLightMsgStartTime = now;
+            strcpy(notificationMsg, "NO LIGHT");
+            buzzerBeep(300, 1, 0);
+            btn1PressActive = false;
+        } else {
+            sys.stopFlag = false;
+            sys.forceFlag = false;
+            sys.timerType = 1;
+            sys.timerEndTime = now + 30000;
+            sys.motor = true;
+            showingStopMessage = false;
+            strcpy(notificationMsg, "30 SEC");
+            digitalWrite(RELAY_PIN, LOW);
+            buzzerBeep(50, 1, 0);
+        }
+    }
+    if (btn1PressActive && currentBtn1 == LOW) {
+        if (!btn1LongPressTriggered && (now - btn1PressStartTime) >= BTN1_LONG_PRESS_MS) {
+            btn1LongPressTriggered = true;
+            sys.stopFlag = false;
+            sys.forceFlag = false;
+            sys.timerType = 1;
+            sys.timerEndTime = now + 60000;
+            sys.motor = true;
+            showingStopMessage = false;
+            strcpy(notificationMsg, "1 MIN");
+            digitalWrite(RELAY_PIN, LOW);
+            buzzerBeep(50, 2, 100);
+        }
+    }
+    if (btn1PressActive && currentBtn1 == HIGH) {
+        btn1PressActive = false;
+    }
+    lastBtn1State = currentBtn1;
+    
+    // BTN2 - 8 MIN
+    if (currentBtn2 == LOW && lastBtn2State == HIGH && (now - btnTime2) > debounceTime) {
+        btnTime2 = now;
+        if (!isLightAvailable()) {
+            noLightMessageShowing = true;
+            noLightMsgStartTime = now;
+            strcpy(notificationMsg, "NO LIGHT");
+            buzzerBeep(300, 1, 0);
+        } else if (isTankFull()) {
+            tankFullMessageShowing = true;
+            lastTankFullTime = now;
+            strcpy(notificationMsg, "TANK FULL");
+            buzzerBeep(300, 1, 0);
+        } else {
+            sys.stopFlag = false;
+            sys.forceFlag = false;
+            sys.timerType = 2;
+            sys.timerEndTime = now + 480000;
+            sys.motor = true;
+            showingStopMessage = false;
+            strcpy(notificationMsg, "RUNNING");
+            digitalWrite(RELAY_PIN, LOW);
+            buzzerBeep(50, 1, 0);
+        }
+    }
+    lastBtn2State = currentBtn2;
+    
+    // BTN3 - SMART MANUAL
+    if (currentBtn3 == LOW && lastBtn3State == HIGH && (now - btnTime3) > debounceTime) {
+        btnTime3 = now;
+        if (!isLightAvailable()) {
+            if (wifiConnected) {
+                String smartManualLightOffMsgs[] = {
+                    "🙄 Oye Hero!\nLight hi nahi hai...\nSmart Manual ko jadoo se chalaun kya? 😂",
+                    "😅 Boss...\nBijli gayab hai!\nSmart Manual bhi wait kar raha hai. ⚡🤣",
+                    "🤦 Arre Ustaad!\nPehle light bulao...\nPhir Smart Manual START hoga! 😂",
+                    "😏 Sir...\nLight ke bina Smart Manual?\nItna bhi overconfidence theek nahi! 🤣",
+                    "😂 Kya baat hai!\nBijli vacation pe hai...\nSmart Manual bhi chhutti mana raha hai! 🌴",
+                    "🫣 Oops!\nLight OFF hai...\nMain Superman nahi hoon! 🦸‍♂️🤣",
+                    "😜 Bhai...\nGenerator samajh rakha hai kya?\nLight aane do pehle! ⚡😂",
+                    "🙃 Mission Failed!\nReason: Bijli ne saath chhod diya.\nSmart Manual ruk gaya! 🤣",
+                    "😎 Boss!\nLight aayegi tabhi Smart Manual chalega...\nAbhi sirf intezar karo! 😂",
+                    "🤭 Light nahi hai...\nSmart Manual ko dhakka maar ke bhi start nahi kar sakte! 🤣"
+                };
+                static int msgIndex = 0;
+                sendTelegramMessage(smartManualLightOffMsgs[msgIndex]);
+                msgIndex++;
+                if (msgIndex > 9) msgIndex = 0;
+            }
+            noLightMessageShowing = true;
+            noLightMsgStartTime = now;
+            strcpy(notificationMsg, "NO LIGHT");
+            buzzerBeep(300, 1, 0);
+        } else if (isTankFull()) {
+            tankFullMessageShowing = true;
+            lastTankFullTime = now;
+            strcpy(notificationMsg, "TANK FULL");
+            if (wifiConnected) {
+                String tankFullSmartManualMsgs[] = {
+                    "Full matlab FULL! 😂",
+                    "Ab kya bharoge? 🤣",
+                    "Space hi nahi hai! 😅",
+                    "Chill, tank full hai. 😎",
+                    "Overachiever detected. 😂",
+                    "No vacancy! 🚫",
+                    "Bas bhai, ho gaya! 😂"
+                };
+                static int msgIndex = 0;
+                sendTelegramMessage(tankFullSmartManualMsgs[msgIndex]);
+                msgIndex++;
+                if (msgIndex > 6) msgIndex = 0;
+            }
+            buzzerBeep(300, 1, 0);
+        } else {
+            sys.stopFlag = false;
+            sys.forceFlag = false;
+            sys.timerType = 99;
+            sys.timerEndTime = 0;
+            sys.motor = true;
+            strcpy(notificationMsg, "RUNNING");
+            showingStopMessage = false;
+            autoStartMessageSent = false;
+            digitalWrite(RELAY_PIN, LOW);
+            if (wifiConnected) sendTelegramMessage("🧠 Smart Manual Running 🌊");
+            buzzerBeep(50, 1, 0);
+        }
+    }
+    lastBtn3State = currentBtn3;
+}
+
+// ==================== NIGHT MODE CHECK ====================
+bool isNightMode() {
+    return (hour >= 22 || hour < 5 || (hour == 5 && minute < 30));
+}
+
+// ==================== SYSTEM MANAGER ====================
+void systemManager() {
+    unsigned long now = millis();
+    
+    if (showingStopMessage && (now - lastStopMessageTime) > 3000) {
+        showingStopMessage = false;
+        sys.stopFlag = false;
+    }
+    
+    if (sys.stopFlag) {
+        sys.motor = false;
+        sys.forceFlag = false;
+        sys.timerType = 0;
+        sys.timerEndTime = 0;
+        sys.customTimerSeconds = 0;
+        if (!showingStopMessage) {
+            showingStopMessage = true;
+            lastStopMessageTime = now;
+        }
+        strcpy(notificationMsg, "STOP");
+        specialEventActive = false;
+        
+        if (isNightMode()) {
+            if (nightClockDelay == 0)
+                nightClockDelay = millis();
+
+            if (millis() - nightClockDelay >= 2000)
+                nightClockMode = true;
+        } else {
+            nightClockMode = false;
+            nightClockDelay = 0;
+        }
+        
+        return;
+    }
+    
+    if (!sys.stopFlag && showingStopMessage) showingStopMessage = false;
+    
+    if (sys.forceFlag) {
+        sys.motor = true;
+    }
+    else if (sys.timerType == 99 || sys.timerType == AUTO_TANK_MODE) {
+        autoModeManager();
+    }
+    else if (sys.timerType != 0) {
+        if (now >= sys.timerEndTime) {
+            sys.timerType = 0;
+            sys.timerEndTime = 0;
+            sys.customTimerSeconds = 0;
+            sys.motor = false;
+            
+            if (wifiConnected) {
+                String timerCompleteMsgs[] = {
+                    "⏰ Time's Up!\nTimer ne bola,\n\"Bas bhai... duty khatam!\" 😂\nMotor OFF 🛑",
+                    "🎉 Mission Complete!\nTimer khatam ✅\nMotor OFF 😎",
+                    "😴 Boss...\nTimer finish ho gaya!\nMotor ab aaram mode mein hai. 😂",
+                    "🤭 Breaking News!\n⏰ Timer Finished\n⚙️ Motor STOPPED\nMission Successful! 🥳",
+                    "🙄 Oye Hero!\nTime poora ho gaya...\nMotor ko overwork mat karwao! 🤣",
+                    "😎 Timer Complete!\nMotor ne apni shift khatam kar di. 👋😂",
+                    "😂 Alarm Baja...\nTimer khatam!\nMotor boli: \"Main chali sone!\" 😴",
+                    "🫡 Duty Over!\n⏰ Timer Complete\n🛑 Motor OFF\nNext command ka intezar hai! 😎",
+                    "😜 Countdown Finished!\nMotor ne khud hi brake laga diya! 😂",
+                    "🏁 Finish Line Crossed!\nTimer Complete ✅\nMotor OFF 🛑"
+                };
+                static int msgIndex = 0;
+                sendTelegramMessage(timerCompleteMsgs[msgIndex]);
+                msgIndex++;
+                if (msgIndex > 9) msgIndex = 0;
+            }
+        } else {
+            sys.motor = true;
+        }
+    }
+    else {
+        sys.motor = false;
+    }
+    
+    // Priority Order
+    if (lightCutMessageShowing) {
+        // keep
+    }
+    else if (tankFullMessageShowing) {
+        // keep
+    }
+    else if (noLightMessageShowing) {
+        strcpy(notificationMsg, "NO LIGHT");
+        if (millis() - noLightMsgStartTime >= 2000) {
+            noLightMessageShowing = false;
+            if (!sys.motor && !sys.stopFlag && !lightCutMessageShowing && !tankFullMessageShowing && !displayLowWater)
+                strcpy(notificationMsg, "READY");
+        }
+    }
+    else if (displayLowWater && !sys.motor) {
+        strcpy(notificationMsg, "LOW WATER");
+    }
+    else if (showingStopMessage) {
+        strcpy(notificationMsg, "STOP");
+        specialEventActive = false;
+    }
+    else if (sys.forceFlag) {
+        strcpy(notificationMsg, "OVERRIDE");
+        specialEventActive = false;
+    }
+    else if (sys.motor) {
+        strcpy(notificationMsg, "RUNNING");
+        specialEventActive = false;
+    }
+    else {
+        if (!lightCutMessageShowing && !tankFullMessageShowing && 
+            !noLightMessageShowing && !displayLowWater && 
+            !showingStopMessage) {
+            EventSteps ev = getEventSteps(month, day);
+            if (ev.stepCount > 0) {
+                if (!specialEventActive) {
+                    specialEventActive = true;
+                    specialEventStep = 0;
+                    specialEventLastSwitch = now;
+                }
+                if (now - specialEventLastSwitch >= SPECIAL_STEP_DURATION) {
+                    specialEventStep++;
+                    if (specialEventStep >= ev.stepCount) specialEventStep = 0;
+                    specialEventLastSwitch = now;
+                }
+                strcpy(notificationMsg, ev.steps[specialEventStep]);
+            } else {
+                specialEventActive = false;
+                strcpy(notificationMsg, "READY");
+            }
+        }
+    }
+    
+    // ==================== NIGHT CLOCK MODE ====================
+    if (isNightMode()) {
+        if (sys.motor) {
+            nightClockMode = false;
+            nightClockDelay = 0;
+        } else {
+            if (nightClockDelay == 0)
+                nightClockDelay = millis();
+
+            if (millis() - nightClockDelay >= 2000)
+                nightClockMode = true;
+        }
+    } else {
+        nightClockMode = false;
+        nightClockDelay = 0;
+    }
+
+    if (sys.motor)
+        nightClockDelay = 0;
+}
+
+// ==================== TIME UPDATE ====================
+void updateTime() {
+    if (!wifiConnected || !ntpSynced) return;
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo, 1)) {
+        hour = timeinfo.tm_hour;
+        minute = timeinfo.tm_min;
+        sec = timeinfo.tm_sec;
+        day = timeinfo.tm_mday;
+        month = timeinfo.tm_mon + 1;
+        year = timeinfo.tm_year + 1900;
+        weekday = timeinfo.tm_wday;
+    }
+}
+
+// ==================== UI DRAWING ====================
+void drawSmoothTimer() {
+    if (sys.timerType == 0 || sys.timerType == 99 || sys.timerType == AUTO_TANK_MODE) return;
+    unsigned long now = millis();
+    if (now >= sys.timerEndTime) return;
+    long remaining = (sys.timerEndTime - now + 999) / 1000;
+    int minutes = remaining / 60;
+    int seconds = remaining % 60;
+    u8g2.setFont(u8g2_font_7x13B_tf);
+    if (minutes > 0) {
+        char minBuf[12];
+        sprintf(minBuf, "%d M", minutes);
+        int16_t w = u8g2.getStrWidth(minBuf);
+        u8g2.drawStr(126 - w, 48, minBuf);
+    }
+    char secBuf[12];
+    sprintf(secBuf, "%d S", seconds);
+    int16_t w = u8g2.getStrWidth(secBuf);
+    u8g2.drawStr(126 - w, 60, secBuf);
+}
+
+void drawTank(float percent) {
+    int x = 4, y = 26, w = 36, h = 34, r = 5;
+    u8g2.drawLine(x, y + r, x, y + h - r);
+    u8g2.drawLine(x + w, y + r, x + w, y + h - r);
+    u8g2.drawCircle(x + r, y + h - r, r, U8G2_DRAW_LOWER_LEFT);
+    u8g2.drawCircle(x + w - r, y + h - r, r, U8G2_DRAW_LOWER_RIGHT);
+    u8g2.drawLine(x + r, y + h, x + w - r, y + h);
+    u8g2.drawCircle(x + r, y + r, r, U8G2_DRAW_UPPER_LEFT);
+    u8g2.drawCircle(x + w - r, y + r, r, U8G2_DRAW_UPPER_RIGHT);
+    int fillHeight = map(percent, 0, 100, 0, h - 6);
+    int waterTop = y + h - fillHeight;
+    u8g2.drawBox(x + 3, waterTop, w - 6, fillHeight);
+    wavePhase++;
+    if (wavePhase > 6) wavePhase = 0;
+    int rippleY = waterTop + wavePhase - 3;
+    for (int i = 0; i < 5; i++) {
+        int px = x + 6 + i * 5;
+        if (rippleY > y + 2 && rippleY < y + h - 2) u8g2.drawPixel(px, rippleY);
+    }
+    if (sys.motor) {
+        for (int i = 0; i < 3; i++) {
+            dropY[i] += dropSpd[i];
+            if (dropY[i] > y + h - 4) {
+                dropY[i] = waterTop - random(5, 15);
+                dropX[i] = random(x + 6, x + w - 6);
+            }
+            u8g2.drawCircle(dropX[i], dropY[i], 1, U8G2_DRAW_ALL);
+        }
+    }
+}
+
+void drawWiFiAnimation() {
+    int x = 112, y = 6;
+    if (wifiConnected) {
+        u8g2.drawBox(x, y, 2, 2);
+        u8g2.drawBox(x+4, y-2, 2, 4);
+        u8g2.drawBox(x+8, y-4, 2, 6);
+        u8g2.drawBox(x+12, y-6, 2, 8);
+    } else {
+        u8g2.drawFrame(x, y, 2, 2);
+        u8g2.drawFrame(x+4, y-2, 2, 4);
+        u8g2.drawFrame(x+8, y-4, 2, 6);
+        u8g2.drawFrame(x+12, y-6, 2, 8);
+        u8g2.drawLine(x+2, y-4, x+12, y-2);
+        u8g2.drawLine(x+2, y-2, x+12, y-4);
+    }
+}
+
+// ==================== DISPLAY PERCENT ====================
+float getDisplayPercent(float realP) {
+    if (realP == 0) return 20;
+    return realP;
+}
+
+void uiTask() {
+    static bool lastNightMode = false;
+    bool currentNightMode = isNightMode();
+    
+    if (currentNightMode != lastNightMode) {
+        u8g2.clearBuffer();
+        u8g2.sendBuffer();
+        lastNightMode = currentNightMode;
+        nightClockDelay = 0;
+        if (!currentNightMode) {
+            nightClockMode = false;
+        }
+    }
+    
+    u8g2.clearBuffer();
+    
+    // ==================== NIGHT CLOCK MODE ====================
+    if (nightClockMode && isNightMode()) {
+        unsigned long cycleTime = millis() % 15000;
+        if (cycleTime < 50) {
+            u8g2.sendBuffer();
+            return;
+        }
+        
+        char buf[6];
+        int displayHour = hour;
+        if (displayHour == 0) displayHour = 12;
+        else if (displayHour > 12) displayHour = displayHour - 12;
+        sprintf(buf, "%02d:%02d", displayHour, minute);
+        
+        u8g2.setFont(u8g2_font_logisoso42_tf);
+        int w = u8g2.getStrWidth(buf);
+        u8g2.drawStr((128 - w) / 2, 52, buf);
+        
+        u8g2.sendBuffer();
+        return;
+    }
+    
+    if (nightClockMode && !isNightMode()) {
+        nightClockMode = false;
+        nightClockDelay = 0;
+        u8g2.clearBuffer();
+    }
+    
+    // ==================== NORMAL UI (DAY MODE) ====================
+    unsigned long now = millis();
+    if (now - lastClockSwitchTime > 3000) {
+        clockMode = (clockMode + 1) % 3;
+        lastClockSwitchTime = now;
+    }
+    
+    char topBuf[30];
+    if (clockMode == 0) {
+        int displayHour = hour;
+        if (displayHour == 0) displayHour = 12;
+        else if (displayHour > 12) displayHour = displayHour - 12;
+        sprintf(topBuf, "%02d:%02d:%02d", displayHour, minute, sec);
+    } else if (clockMode == 1) {
+        sprintf(topBuf, "%02d/%02d/%04d", day, month, year);
+    } else {
+        snprintf(topBuf, sizeof(topBuf), "%s", days[weekday]);
+    }
+    
+    u8g2.setFont(u8g2_font_7x14B_tf);
+    u8g2.drawStr((128 - u8g2.getStrWidth(topBuf)) / 2, 12, topBuf);
+    drawWiFiAnimation();
+    u8g2.setFont(u8g2_font_6x10_tf);
+    int16_t notifW = u8g2.getStrWidth(notificationMsg);
+    u8g2.drawStr(128 - notifW - 4, 26, notificationMsg);
+    
+    float dispPercent = getDisplayPercent(aiLevel);
+    
+    drawTank(dispPercent);
+    drawSmoothTimer();
+    char pbuf[6];
+    sprintf(pbuf, "%d%%", (int)(dispPercent + 0.5));
+    u8g2.setFont(u8g2_font_logisoso18_tr);
+    u8g2.drawStr(44, 56, pbuf);
+    u8g2.sendBuffer();
+}
+
+// ==================== BOOT SCREEN ====================
+void showBootScreen() {
+    unsigned long startTime = millis();
+    while (millis() - startTime < 1000) {
+        int progress = map(millis() - startTime, 0, 1000, 0, 100);
+        u8g2.clearBuffer();
+        u8g2.setFont(u8g2_font_7x14B_tf);
+        String dots = "";
+        int phase = (millis() / 400) % 3;
+        if (phase == 0) dots = ".";
+        if (phase == 1) dots = "..";
+        if (phase == 2) dots = "...";
+        String loadingText = "Loading" + dots;
+        u8g2.drawStr(30, 26, loadingText.c_str());
+        u8g2.drawFrame(14, 40, 100, 4);
+        int barWidth = map(progress, 0, 100, 0, 98);
+        if (barWidth > 0) u8g2.drawBox(15, 41, barWidth, 2);
+        u8g2.sendBuffer();
+        delay(20);
+    }
+    unsigned long endTime = millis() + 1400;
+    while (millis() < endTime) {
+        u8g2.clearBuffer();
+        u8g2.setFont(u8g2_font_7x14B_tf);
+        u8g2.drawStr(16, 40, "By Sunny Pandit");
+        u8g2.sendBuffer();
+        delay(20);
+    }
+    u8g2.clearBuffer();
+    u8g2.sendBuffer();
+}
+
+// ==================== SETUP ====================
+void setup() {
+    Serial.begin(115200);
+    delay(100);
+    EEPROM.begin(EEPROM_SIZE);
+    incrementBootCount();
+    sys.motor = false;
+    sys.forceFlag = false;
+    sys.stopFlag = false;
+    sys.timerType = 0;
+    sys.timerEndTime = 0;
+    sys.motorStartTime = 0;
+    sys.customTimerSeconds = 0;
+    Wire.begin(OLED_SDA, OLED_SCL);
+    u8g2.begin();
+    u8g2.setBusClock(400000);
+    u8g2.setPowerSave(0);
+    pinMode(TRIG_PIN, OUTPUT);
+    pinMode(ECHO_PIN, INPUT);
+    pinMode(RELAY_PIN, OUTPUT);
+    digitalWrite(RELAY_PIN, HIGH);
+    pinMode(BUZZER_PIN, OUTPUT);
+    digitalWrite(BUZZER_PIN, LOW);
+    pinMode(BTN1, INPUT_PULLUP);
+    pinMode(BTN2, INPUT_PULLUP);
+    pinMode(BTN3, INPUT_PULLUP);
+    pinMode(BTN4, INPUT_PULLUP);
+    pinMode(BTN5, INPUT_PULLUP);
+    pinMode(LDR_PIN, INPUT_PULLUP);
+    pinMode(TANK_LOW_PIN, INPUT_PULLUP);
+    pinMode(TANK_HIGH_PIN, INPUT_PULLUP);
+    lastBtn1State = digitalRead(BTN1);
+    lastBtn2State = digitalRead(BTN2);
+    lastBtn3State = digitalRead(BTN3);
+    lastBtn4State = digitalRead(BTN4);
+    lastBtn5State = digitalRead(BTN5);
+    attachInterrupt(digitalPinToInterrupt(ECHO_PIN), echoISR, CHANGE);
+    showBootScreen();
+    uiTask();
+    u8g2.sendBuffer();
+    client.setInsecure();
+    client.setTimeout(3000);
+    initWiFi();
+    ArduinoOTA.setHostname("ESP32-TankController");
+    ArduinoOTA.setPassword("RadheKrishna#108");
+    ArduinoOTA.onStart([]() {
+        String type;
+        if (ArduinoOTA.getCommand() == U_FLASH) type = "sketch";
+        else type = "filesystem";
+        Serial.println("OTA Start: " + type);
+    });
+    ArduinoOTA.onEnd([]() { Serial.println("\nOTA End"); });
+    ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+        Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
+    });
+    ArduinoOTA.onError([](ota_error_t error) {
+        Serial.printf("Error[%u]: ", error);
+        if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
+        else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
+        else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
+        else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
+        else if (error == OTA_END_ERROR) Serial.println("End Failed");
+    });
+    ArduinoOTA.begin();
+    
+    telegramQueue = xQueueCreate(15, 160 * sizeof(char));
+    
+    xTaskCreatePinnedToCore(telegramTask, "TelegramTask", 17000, NULL, 1, NULL, 1);
+    
+    bootTime = millis();
+}
+
+// ==================== MAIN LOOP ====================
+void loop() {
+    unsigned long now = millis();
+    
+    if (now - lastWiFiCheckTime > 2000) {
+        checkWiFi();
+        lastWiFiCheckTime = now;
+    }
+    
+    if (now - lastSensorTime > 200) {
+        float levelPercent = getUltrasonicLevelPercent();
+        aiLevel = kalmanUpdate(levelPercent);
+        lastSensorTime = now;
+    }
+    
+    buttonControlTask();
+    checkAndHandleLightCut();
+    checkAndHandleTankSensors();
+    systemManager();
+    
+    digitalWrite(RELAY_PIN, sys.motor ? LOW : HIGH);
+    
+    if (now - lastTimeFetchTime > 2000) {
+        updateTime();
+        lastTimeFetchTime = now;
+    }
+    
+    if (now - lastUITime > 150) {
+        uiTask();
+        lastUITime = now;
+    }
+    
+    ArduinoOTA.handle();
+    delay(1);
+}
