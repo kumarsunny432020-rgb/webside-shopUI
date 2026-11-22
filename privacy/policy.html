@@ -9,8 +9,9 @@
 :root{--bg:#05060d;--tx:#f4f6ff;--mu:#9aa2c4;--cy:#27e1ff;--bd:rgba(255,255,255,.12);color-scheme:dark}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--tx);font:16px/1.7 "Segoe UI",system-ui,sans-serif}
-header{border-bottom:1px solid var(--bd);padding:18px 22px}
+header{border-bottom:1px solid var(--bd);padding:18px 22px;display:flex;justify-content:space-between;align-items:center}
 header a{color:var(--tx);text-decoration:none;font-weight:600;letter-spacing:.04em}
+header a.back{font-size:.9rem;color:var(--cy);font-weight:500}
 main{max-width:800px;margin:0 auto;padding:56px 22px 80px}
 h1{font:500 clamp(2rem,5vw,3rem)/1.1 Georgia,serif;margin:0 0 .4em}
 h2{font-size:1.1rem;margin:2em 0 .4em}
@@ -22,7 +23,10 @@ footer{border-top:1px solid var(--bd);padding:26px 22px;text-align:center;color:
 </style>
 </head>
 <body>
-<header><a href="/">AAROHI AI</a></header>
+<header>
+  <a href="index.html">AAROHI AI</a>
+  <a href="index.html" class="back">← Back to Home</a>
+</header>
 <main>
 <h1>Privacy Policy</h1>
 <p>Aarohi AI is a smart home automation platform that lets you control and monitor compatible devices such as lights, fans and water motors. This policy explains how information is handled when you use the Aarohi AI app and services. It should be read together with our Terms &amp; Conditions.</p>
